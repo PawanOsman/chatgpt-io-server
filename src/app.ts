@@ -1,10 +1,12 @@
-import express, { Express, Request, Response } from "express";
+import express, { Request, Response } from "express";
 import http from "http";
 import { Server } from "socket.io";
 import { config } from "dotenv";
 import { BypassServer, AppDbContext, Log } from "./classes/index.js";
-import { SocketClient, IpData, Result } from "./dto/index.js";
-import { AccountType, ClientType, LogLevel } from "./enums/index.js";
+import { Profile, SocketClient, IpData, Result } from "./dto/index.js";
+import { ClientStatus, AccountType, ClientType, LogLevel } from "./enums/index.js";
+import Linq from "./utils/linq.js";
+import Wait from "./utils/wait.js";
 
 config();
 const app = express();
@@ -18,7 +20,7 @@ const log = new Log(LogLevel.Trace);
 const database = new AppDbContext();
 await database.WaitForLoad();
 
-let ipDatas = new Map<string, IpData>();
+let ipDataList = new Linq<IpData>();
 
 function getBypassServer(isProxy: boolean = true): BypassServer {
 	let bypassServer = database.bypassServers
@@ -55,107 +57,165 @@ io.on("connection", (socket) => {
 
 	let ipData: IpData = {
 		ip: clientIp,
-		accounts: [],
-		blocked: false,
-		busy: false,
+		accounts: new Linq<Profile>(),
+		status: IpStatus.Idle,
+		totalRequests: 0,
 		failedAuth: 0,
-		duplicateAccounts: 0,
 		lastRequestTime: Date.now(),
-		clients: new Map<string, SocketClient>(),
+		clients: new Linq<SocketClient>(),
 	};
 
-	if (ipDatas.has(ipData.ip)) {
-		ipData = ipDatas.get(ipData.ip);
+	if (ipDataList.Any((x) => x.ip == ipData.ip)) {
+		ipData = ipDataList.FirstOrDefault((x) => x.ip == ipData.ip);
 	} else {
-		ipDatas.set(ipData.ip, ipData);
+		ipDataList.Add(ipData);
 	}
 
 	let client: SocketClient = new SocketClient(socket.id, socket);
 
-	if (ipData.clients.has(client.id)) {
-		client = ipData.clients.get(client.id);
+	if (ipData.clients.Any((x) => x.id == client.id)) {
+		client = ipData.clients.FirstOrDefault((x) => x.id == client.id);
 	} else {
-		ipData.clients.set(client.id, client);
+		ipData.clients.Add(client);
 	}
 
 	switch (query.client) {
 		case "nodejs":
-			client.clientType = ClientType.nodejs;
+			client.type = ClientType.nodejs;
 			break;
 		case "csharp":
-			client.clientType = ClientType.csharp;
+			client.type = ClientType.csharp;
 			break;
 		case "python":
-			client.clientType = ClientType.python;
+			client.type = ClientType.python;
 			break;
 	}
 
 	client.version = query.version.toString();
 	client.versionCode = parseInt(query.versionCode.toString());
 
-	log.info(`Client connected: ${clientIp} ${client.id} (${ClientType[client.clientType]} v${client.version})`);
+	log.info(`Client connected: ${clientIp} ${client.id} (${ClientType[client.type]} v${client.version})`);
 
 	client.socket.on("getSession", async (data: string, callback) => {
-		let bypassServer: BypassServer = getBypassServer(false);
-		log.info(`getSession: ${clientIp} ${client.id} (${ClientType[client.clientType]} v${client.version})`);
-
-		if (!bypassServer) {
+		ipData.lastRequestTime = Date.now();
+		ipData.totalRequests++;
+		if (ipData.status === IpStatus.Busy || client.status === ClientStatus.GettingSession) {
 			callback({
 				status: false,
-				error: "No bypass server available",
+				error: "Another request is already in progress. please wait 30 seconds and try again.",
 			});
 			return;
 		}
+		ipData.status = IpStatus.Busy;
+		client.status = ClientStatus.GettingSession;
+		try {
+			let bypassServer: BypassServer = getBypassServer(false);
+			log.info(`getSession: ${clientIp} ${client.id} (${ClientType[client.type]} v${client.version})`);
 
-		let response = await bypassServer.getSession(data);
-		if (response.status) {
-			callback(response.data);
-		} else {
-			callback(response);
+			if (!bypassServer) {
+				callback({
+					status: false,
+					error: "No bypass server available",
+				});
+				return;
+			}
+
+			let response = await bypassServer.getSession(data);
+			if (response.status) {
+				callback(response.data);
+			} else {
+				callback(response);
+			}
+			setTimeout(() => {
+				ipData.status = IpStatus.Idle;
+				client.status = ClientStatus.Idle;
+			}, 30000);
+		} catch (e) {
+			log.error(`getSession: ${clientIp} ${client.id} (${ClientType[client.type]} v${client.version}) ${e}`);
+			setTimeout(() => {
+				ipData.status = IpStatus.Idle;
+				client.status = ClientStatus.Idle;
+			}, 30000);
+			callback({
+				status: false,
+				error: `An error occurred while getting session please try again in 30 seconds.`,
+			});
 		}
 	});
 
 	client.socket.on("askQuestion", async (data, callback) => {
-		let bypassServer: BypassServer = getBypassServer();
+		ipData.lastRequestTime = Date.now();
+		ipData.totalRequests++;
+		while (client.status === ClientStatus.ProcessingQuestion || client.status === ClientStatus.GettingSession) {
+			await Wait(25);
+		}
+		client.status = ClientStatus.ProcessingQuestion;
+		try {
+			let bypassServer: BypassServer = getBypassServer();
 
-		if (!bypassServer) {
+			if (!bypassServer) {
+				callback({
+					status: false,
+					error: "No bypass server available",
+				});
+				return;
+			}
+
+			let response = await bypassServer.ask(data.prompt, data.conversationId, data.parentId, data.auth);
+			if (response.status) {
+				callback(response.data);
+			} else {
+				callback(response);
+			}
+			client.status = ClientStatus.Idle;
+		} catch (e) {
+			log.error(`askQuestion: ${clientIp} ${client.id} (${ClientType[client.type]} v${client.version}) ${e}`);
+			client.status = ClientStatus.Idle;
 			callback({
 				status: false,
-				error: "No bypass server available",
+				error: `An error occurred while processing question please try again in a few seconds.`,
 			});
-			return;
-		}
-
-		let response = await bypassServer.ask(data.prompt, data.conversationId, data.parentId, data.auth);
-		if (response.status) {
-			callback(response.data);
-		} else {
-			callback(response);
 		}
 	});
 
 	client.socket.on("askQuestionPro", async (data, callback) => {
-		let bypassServer: BypassServer = getBypassServer();
+		ipData.lastRequestTime = Date.now();
+		ipData.totalRequests++;
+		while (client.status === ClientStatus.ProcessingQuestion || client.status === ClientStatus.GettingSession) {
+			await Wait(25);
+		}
+		client.status = ClientStatus.ProcessingQuestion;
+		try {
+			let bypassServer: BypassServer = getBypassServer();
 
-		if (!bypassServer) {
+			if (!bypassServer) {
+				callback({
+					status: false,
+					error: "No bypass server available",
+				});
+				return;
+			}
+
+			let response = await bypassServer.ask(data.prompt, data.conversationId, data.parentId, data.auth, AccountType.Pro);
+			if (response.status) {
+				callback(response.data);
+			} else {
+				callback(response);
+			}
+			client.status = ClientStatus.Idle;
+		} catch (e) {
+			log.error(`askQuestion: ${clientIp} ${client.id} (${ClientType[client.type]} v${client.version}) ${e}`);
+			client.status = ClientStatus.Idle;
 			callback({
 				status: false,
-				error: "No bypass server available",
+				error: `An error occurred while processing question please try again in a few seconds.`,
 			});
-			return;
-		}
-
-		let response = await bypassServer.ask(data.prompt, data.conversationId, data.parentId, data.auth, AccountType.Pro);
-		if (response.status) {
-			callback(response.data);
-		} else {
-			callback(response);
 		}
 	});
 
 	client.socket.on("disconnect", () => {
-		log.info(`Client disconnected: ${clientIp} ${client.id} (${ClientType[client.clientType]} v${client.version})`);
-		ipData.clients.delete(client.id);
+		log.info(`Client disconnected: ${clientIp} ${client.id} (${ClientType[client.type]} v${client.version})`);
+		ipData.clients.Remove(client);
 	});
 });
 
