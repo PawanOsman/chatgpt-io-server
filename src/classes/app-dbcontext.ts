@@ -7,7 +7,7 @@ class AppDbContext extends DbContext {
 		super();
 	}
 
-	public bypassServers = new DbSet<IBypassServer>("bypassServers");
+	public bypassServers: DbSet<IBypassServer> = new DbSet<IBypassServer>("bypassServers");
 }
 
 export default AppDbContext;
