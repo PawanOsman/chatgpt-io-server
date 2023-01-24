@@ -1,10 +1,11 @@
 import { Socket } from "socket.io";
-import { ClientType } from "../enums/index.js";
+import { ClientType, ClientStatus } from "../enums/index.js";
 
 class SocketClient {
 	public id: string;
 	public socket: Socket;
-	public clientType: ClientType = ClientType.nodejs;
+	public status: ClientStatus = ClientStatus.Idle;
+	public type: ClientType = ClientType.unknown;
 	public version: string;
 	public versionCode: number = 0;
 	constructor(id: string, socket: Socket = null) {
